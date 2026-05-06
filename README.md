@@ -108,6 +108,7 @@ The experiments evaluate visual quality, temporal consistency, and clinical fide
 ## 🛠️ Usage
 
 **Tokenizer**
+
 To train the tokenizer for CMR synthesis, run:
 
 ```bash
@@ -115,6 +116,7 @@ python train_tokenizer_CMR.py
 ```
 
 **Generation**
+
 To train the diffusion model for CMR Volume2Seq synthesis, run:
 
 ```bash
