@@ -1,0 +1,348 @@
+import math
+from typing import Dict
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from einops import rearrange
+from LeanVAE.autoencoder import *
+from monai.networks.nets import UNet
+from timm.models.vision_transformer import VisionTransformer
+
+
+def sample_gumbel(shape, device=None, dtype=None, eps: float = 1e-20):
+    """Sample standard Gumbel(0,1) noise."""
+    U = torch.rand(shape, device=device, dtype=dtype)
+    return -torch.log(-torch.log(U + eps) + eps)
+
+def gumbel_softmax_st_topk(logits: torch.Tensor,
+                           K: int,
+                           tau: float = 1.0):
+    """
+    Gumbel-Softmax straight-through top-k.
+
+    Args:
+        logits: [B, T] unnormalized scores for each time step.
+        K: number of keyframes to select.
+        tau: temperature for Gumbel-Softmax (lower -> sharper).
+
+    Returns:
+        mask_st: [B, T]  -- straight-through k-hot mask (forward hard, backward soft)
+        indices: [B, K]  -- selected keyframe indices (for logging / inference)
+        y_soft: [B, T]   -- underlying soft weights (gradient carrier)
+    """
+    B, T = logits.shape
+    device = logits.device
+    dtype = logits.dtype
+
+    g = sample_gumbel((B, T), device=device, dtype=dtype)
+
+    y_soft = F.softmax((logits + g) / tau, dim=-1)
+
+    topk = torch.topk(y_soft, K, dim=-1)
+    indices = topk.indices
+
+    y_hard = torch.zeros_like(y_soft)
+    y_hard.scatter_(1, indices, 1.0)
+
+    mask_st = y_hard + y_soft - y_soft.detach()
+    return mask_st, indices, y_soft
+
+class KeyframeSelector(nn.Module):
+    def __init__(
+        self,
+        latent_dim: int = 256,
+        hidden_dim: int = 256,
+        n_layers: int = 2,
+        n_heads: int = 4,
+        dropout: float = 0.1,
+        use_visual: bool = False,
+    ):
+        super().__init__()
+        self.use_visual = use_visual
+        in_dim = latent_dim * (2 if use_visual else 1)
+        self.input_proj = nn.Linear(in_dim, hidden_dim)
+        enc_layer = nn.TransformerEncoderLayer(
+            d_model=hidden_dim,
+            nhead=n_heads,
+            dim_feedforward=4 * hidden_dim,
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.encoder = nn.TransformerEncoder(enc_layer, num_layers=n_layers)
+        self.score_head = nn.Linear(hidden_dim, 1)
+
+    def forward(self, z_time: torch.Tensor, z_traj: torch.Tensor = None):
+        if self.use_visual:
+            if z_traj is None:
+                raise ValueError("use_visual=True requires visual tokens.")
+            x = torch.cat([z_traj.detach(), z_time], dim=-1)
+        else:
+            x = z_time
+        x = self.encoder(self.input_proj(x))
+        logits = self.score_head(x).squeeze(-1)
+        return logits, torch.softmax(logits, dim=-1)
+
+class Keyframe2Trajectory(nn.Module):
+    """
+    Keyframe selector that runs in the cardiac latent space.
+    Input:
+      z_traj   [B, T, D]  - cardiac echo tokens
+      idx_k   [B, K]  - indices of keyframes
+    Output:
+      loss_rec
+    """
+    def __init__(
+        self,
+        latent_dim,
+        channels,
+        strides,
+        num_frames,
+        num_keyframes
+    ):
+        super().__init__()
+        self.keyframe_rec = UNet(spatial_dims=3,
+                                 in_channels=latent_dim + 1,
+                                 out_channels=latent_dim,
+                                 channels=channels,
+                                 strides=strides)
+        self.num_frames = num_frames
+        self.num_keyframes = num_keyframes
+
+    def forward(self, z_traj, logits):
+        """
+        full latent: z_traj [B, C, T, H, W]
+        keyframe indices: idx_k [B, K]
+        """
+
+        B, C, T, H, W = z_traj.shape
+
+        mask_st, indices, y_soft = gumbel_softmax_st_topk(logits, K=self.num_keyframes, tau=1.0)
+
+        mask_3d = mask_st.unsqueeze(1).unsqueeze(-1).unsqueeze(-1)
+        mask_3d = mask_3d.expand(-1, 1, -1, H, W)
+
+        z_traj_ = z_traj * mask_3d
+        z_in = torch.cat([z_traj_, mask_3d], dim=1)
+
+        z_rec = self.keyframe_rec(z_in)
+        z_rec = z_rec.view(B, C, T, H, W)
+
+        mask_nonkey = 1.0 - mask_st
+        mask_nonkey = mask_nonkey.unsqueeze(1).unsqueeze(-1).unsqueeze(-1)
+
+        diff2 = (z_rec - z_traj) ** 2
+        mask_full = mask_nonkey.expand_as(diff2)
+
+        num_voxels = mask_full.sum()
+        loss_rec = (diff2 * mask_full).sum() / (num_voxels + 1e-8)
+
+        return loss_rec
+
+class Tokenizer_ECHO(nn.Module):
+    def __init__(
+            self,
+            args,
+
+    ):
+        super().__init__()
+
+        self.args = args
+
+        self.echo_tok = LeanVAE(args)
+        self.echo_proj = nn.Sequential(
+            nn.Linear(self.args.echo_latent_dim, self.args.proj_dim * 2),
+            nn.ReLU(inplace=True),
+            nn.Linear(self.args.proj_dim * 2, self.args.proj_dim),
+        )
+
+        self.ECG_encoder = VisionTransformer(img_size=self.args.ECG_size,
+                                        patch_size=self.args.ECG_enc_patch,
+                                        in_chans=3,
+                                        embed_dim=args.ECG_enc_dim,
+                                        depth=args.ECG_enc_depth,
+                                        num_heads=8)
+        self.ECG_proj = nn.Sequential(
+            nn.Linear(self.args.ECG_enc_dim, self.args.proj_dim * 2),
+            nn.ReLU(inplace=True),
+            nn.Linear(self.args.proj_dim * 2, self.args.proj_dim),
+        )
+
+        self.keyframe_selector = KeyframeSelector(self.args.proj_dim, self.args.selector_hidden,
+                                                  self.args.selector_layers, self.args.selector_heads,
+                                                  use_visual=False)
+
+        self.latent_length = (self.args.echo_length - 1) // 4 + 1
+        self.keyframe2trajectory = Keyframe2Trajectory(self.args.echo_latent_dim, self.args.unet_channels, self.args.unet_strides,
+                                                       self.args.num_frames, self.args.num_keyframes)
+
+    def coverage_regularization_bins(self,
+                                     q: torch.Tensor,
+                                     num_bins: int = 4) -> torch.Tensor:
+        """
+        Coverage regularization: encourage keyframe importance q to cover
+        the whole cardiac cycle instead of collapsing to a single phase.
+
+        Args:
+            q: [B, T]  soft keyframe importance (non-negative, not necessarily sum=1)
+            num_bins: number of coarse temporal bins over the cycle (e.g., 4 or 5)
+
+        Returns:
+            cov_loss: scalar coverage loss (the smaller, the better coverage)
+        """
+        B, T = q.shape
+
+        p = q / (q.sum(dim=1, keepdim=True) + 1e-8)
+
+        bin_size = T // num_bins
+        masses = []
+        start = 0
+        for b in range(num_bins):
+            end = start + bin_size
+            if b == num_bins - 1:
+                end = T
+            mass_b = p[:, start:end].sum(dim=1)
+            masses.append(mass_b)
+            start = end
+        masses = torch.stack(masses, dim=1)
+
+        p_bin = masses / (masses.sum(dim=1, keepdim=True) + 1e-8)
+
+        log_p_bin = torch.log(p_bin + 1e-8)
+        log_u = math.log(1.0 / num_bins)
+        kl_div = (p_bin * (log_p_bin - log_u)).sum(dim=1)
+
+        cov_loss = kl_div.mean()
+        return cov_loss
+
+    def get_keyframe_indices(self, q: torch.Tensor) -> torch.Tensor:
+
+        B, T = q.shape
+        K = min(self.args.num_keyframes, T)
+
+        _, indices_unsorted = torch.topk(q, k=K, dim=-1, largest=True, sorted=False)
+
+        keyframe_idx, _ = torch.sort(indices_unsorted, dim=-1)
+
+        return keyframe_idx
+
+    def build_alignment_matrix(self, q: torch.Tensor,) -> torch.Tensor:
+        """
+        Build physiology-like alignment matrix A_{k,t} using:
+          - time distance along the cardiac cycle
+          - keyframe importance weights q
+
+        q: [B, T]   soft keyframe importance (sum_t q_t = 1 for each seq)
+
+        Returns:
+          A: [B, T, T], where row = ECG time k, col = CMR time t
+        """
+        B, T = q.shape
+        device = q.device
+
+        phi = torch.linspace(0.0, 1.0, T, device=device)
+        phase_k = phi.view(1, T, 1)
+        phase_t = phi.view(1, 1, T)
+
+        d_time = torch.abs(phase_k - phase_t)
+        d_time = torch.minimum(d_time, 1.0 - d_time)
+        d_time = d_time.expand(B, -1, -1)
+
+        q_k = q.unsqueeze(2)
+        q_t = q.unsqueeze(1)
+        imp = 0.5 * (q_k + q_t)
+
+        imp_mean = imp.mean(dim=(1, 2), keepdim=True)
+        imp_norm = imp / (imp_mean + 1e-8)
+
+        d2 = d_time.pow(2) / (imp_norm + 1e-8)
+
+        A_unnorm = torch.exp(-d2 / (2.0 * (self.args.sigma_align ** 2) + 1e-8))
+
+        A = A_unnorm / (A_unnorm.sum(dim=-1, keepdim=True) + 1e-8)
+        return A
+
+    def local_contrastive_loss(
+        self,
+        z_traj: torch.Tensor,
+        z_time: torch.Tensor,
+        q: torch.Tensor,
+    ):
+        """
+        Local contrastive loss using A_{k,t} built from time distance + q.
+        """
+        B, T, D = z_traj.shape
+
+        z_traj = F.normalize(z_traj, dim=-1)
+        z_time = F.normalize(z_time, dim=-1)
+        S = torch.einsum("bkd, btd -> bkt", z_traj, z_time) / math.sqrt(D)
+
+        A = self.build_alignment_matrix(q)
+
+        logits_e2v = S / self.args.tau
+        log_probs_e2v = logits_e2v.log_softmax(dim=-1)
+
+        w_t = (1 + self.args.lambda_q * q).unsqueeze(1)
+
+        loss_e2v = -(A * w_t * log_probs_e2v).sum(dim=-1).mean()
+
+        S_rev = S.transpose(1, 2).contiguous()
+        logits_v2e = S_rev / self.args.tau
+        log_probs_v2e = logits_v2e.log_softmax(dim=-1)
+
+        A_rev = A.transpose(1, 2).contiguous()
+        w_t_row = w_t.transpose(1, 2).contiguous()
+        loss_v2e = -(A_rev * w_t_row * log_probs_v2e).sum(dim=-1).mean()
+
+        loss_cl = 0.5 * (loss_e2v + loss_v2e)
+
+        return loss_cl, A
+
+    def forward(self, x_echo: torch.Tensor, x_ecg: torch.Tensor, stage: str = "full"):
+        """
+        x_echo: [B, 3, 125, 112, 112]
+        x_ecg: [B, 3, 1, 128]
+        """
+
+        _, echo_rec, z_traj, _, _, posterior = self.echo_tok(x_echo)
+        loss_kl = posterior.kl().mean()
+
+        if stage == "echo_pretrain":
+            return {
+                "loss_kl": loss_kl,
+                "rec_echo": echo_rec,
+                "z_echo": z_traj,
+            }
+
+        z_traj_ = z_traj.mean(dim=(3, 4))
+        z_traj_ = rearrange(z_traj_, "b c t -> b t c")
+
+        z_time = self.ECG_encoder.forward_features(x_ecg)
+        z_time = z_time[:, 1:, :]
+
+        z_traj_proj = self.echo_proj(z_traj_)
+        z_time_proj = self.ECG_proj(z_time)
+
+        logits, q = self.keyframe_selector(z_time_proj, z_traj_proj)
+        idx_k = self.get_keyframe_indices(q)
+
+        loss_conv = self.coverage_regularization_bins(q, self.args.num_bins)
+
+        loss_k2t = self.keyframe2trajectory(z_traj, logits)
+
+        loss_cl, A = self.local_contrastive_loss(z_traj_proj, z_time_proj, q)
+
+        return {
+            'loss_kl': loss_kl,
+            'loss_conv': loss_conv,
+            'loss_k2t': loss_k2t,
+            'loss_cl': loss_cl,
+            'z_echo': z_traj,
+            'z_ecg': z_time,
+            'z_ecg_proj': z_time_proj,
+            'z_traj': z_traj_proj,
+            'align_matrix': A,
+            'rec_echo': echo_rec,
+            'keyframe_q': q,
+            'keyframe_idx': idx_k
+        }
